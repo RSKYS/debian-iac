@@ -1,0 +1,344 @@
+---
+- name: Setup and harden Debian/Ubuntu server
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    # Leave empty to automatically detect the interface.
+    # Override with: -e network_interface=ens18
+    network_interface: ""
+
+    # Skip Netplan configuration when the host is behind NAT
+    skip_on_nat: false
+
+  pre_tasks:
+    - name: Update APT package cache
+      ansible.builtin.apt:
+        update_cache: true
+        force_apt_get: true
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - iproute2
+          - netplan.io
+          - systemd-resolved
+          - systemd-timesyncd
+          - fastfetch
+          - openssh-server
+          - zstd
+          - dosfstools
+        state: present
+        force_apt_get: true
+
+    - name: Perform distribution upgrade and autoremove
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: true
+        force_apt_get: true
+
+  tasks:
+    - name: Configure kernel network hardening
+      ansible.builtin.copy:
+        dest: /etc/sysctl.conf
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          net.ipv4.conf.all.rp_filter = 1
+          net.ipv4.conf.default.rp_filter = 1
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.default.accept_redirects = 0
+          net.ipv6.conf.all.accept_redirects = 0
+          net.ipv6.conf.default.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.send_redirects = 0
+          net.ipv4.conf.all.accept_source_route = 0
+          net.ipv4.conf.default.accept_source_route = 0
+          net.ipv6.conf.all.accept_source_route = 0
+          net.ipv6.conf.default.accept_source_route = 0
+          net.ipv4.tcp_syncookies = 1
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+          net.ipv4.icmp_ignore_bogus_error_responses = 1
+          net.ipv4.conf.all.log_martians = 1
+          net.ipv4.conf.default.log_martians = 1
+          net.ipv4.ip_forward = 0
+          net.ipv6.conf.all.forwarding = 0
+      notify: Apply sysctl settings
+
+    - name: Enable and start systemd services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        masked: false
+        state: started
+      loop:
+        - systemd-resolved.service
+        - systemd-timesyncd.service
+
+    - name: Discover default IPv4 route
+      ansible.builtin.command:
+        argv:
+          - ip
+          - -4
+          - route
+          - show
+          - default
+      register: default_route
+      changed_when: false
+
+    - name: Determine network interface
+      ansible.builtin.set_fact:
+        target_iface: >-
+          {{
+            (network_interface | trim)
+            if (network_interface | default('') | trim | length > 0)
+            else (
+              default_route.stdout
+              | regex_findall('(?:^|\s)dev\s+(\S+)')
+              | first
+              | default('')
+            )
+          }}
+
+    - name: Validate network interface
+      ansible.builtin.assert:
+        that:
+          - target_iface | length > 0
+          - target_iface is match('^[A-Za-z0-9_.-]+$')
+          - target_iface | length <= 15
+        fail_msg: "Unable to determine a valid network interface."
+
+    - name: Discover interface IPv4 addresses
+      ansible.builtin.command:
+        argv:
+          - ip
+          - -o
+          - -4
+          - addr
+          - show
+          - dev
+          - "{{ target_iface }}"
+          - scope
+          - global
+      register: interface_addresses
+      changed_when: false
+
+    - name: Extract IPv4 addresses
+      ansible.builtin.set_fact:
+        static_addresses: >-
+          {{
+            interface_addresses.stdout
+            | regex_findall('inet\s+(\S+)')
+          }}
+
+    - name: Detect private (NAT) IPv4 addressing
+      ansible.builtin.set_fact:
+        behind_nat: >-
+          {{
+            static_addresses
+            | map('regex_replace', '/.*$', '')
+            | select('match', '^(10[.]|192[.]168[.]|172[.](1[6-9]|2[0-9]|3[01])[.])')
+            | list
+            | length > 0
+          }}
+
+    - name: Decide whether to manage Netplan
+      ansible.builtin.set_fact:
+        manage_netplan: "{{ not (skip_on_nat | bool and behind_nat | bool) }}"
+
+    - name: Report NAT decision
+      ansible.builtin.debug:
+        msg: >-
+          Interface {{ target_iface }} addresses: {{ static_addresses | join(', ') }}.
+          NAT detected: {{ behind_nat }}.
+          Netplan management: {{ 'enabled' if manage_netplan | bool else 'skipped' }}.
+
+    - name: Configure static networking
+      when: manage_netplan | bool
+      block:
+
+        - name: Discover interface default gateway
+          ansible.builtin.command:
+            argv:
+              - ip
+              - -4
+              - route
+              - show
+              - default
+              - dev
+              - "{{ target_iface }}"
+          register: interface_route
+          changed_when: false
+
+        - name: Extract default gateway
+          ansible.builtin.set_fact:
+            default_gateway: >-
+              {{
+                interface_route.stdout
+                | regex_findall('(?:^|\s)via\s+(\S+)')
+                | first
+                | default('')
+              }}
+
+        - name: Validate network configuration
+          ansible.builtin.assert:
+            that:
+              - static_addresses | length > 0
+              - default_gateway | length > 0
+            fail_msg: >-
+              Unable to discover IPv4 addresses or default gateway
+              for interface {{ target_iface }}.
+
+        - name: Check systemd resolver configuration
+          ansible.builtin.stat:
+            path: /run/systemd/resolve/resolv.conf
+          register: resolve_conf
+
+        - name: Read DNS configuration
+          ansible.builtin.slurp:
+            src: >-
+              {{
+                '/run/systemd/resolve/resolv.conf'
+                if resolve_conf.stat.exists
+                else '/etc/resolv.conf'
+              }}
+          register: dns_file
+
+        - name: Extract DNS servers
+          ansible.builtin.set_fact:
+            dns_servers: >-
+              {{
+                (
+                  dns_file.content
+                  | b64decode
+                  | regex_findall('(?m)^\s*nameserver\s+(\S+)')
+                )
+                | reject('match', '^127\.')
+                | reject('equalto', '::1')
+                | reject('equalto', '0.0.0.0')
+                | unique
+                | list
+              }}
+
+        - name: Build Netplan interface configuration
+          ansible.builtin.set_fact:
+            netplan_iface:
+              dhcp4: false
+              dhcp6: false
+              addresses: "{{ static_addresses }}"
+              routes:
+                - to: default
+                  via: "{{ default_gateway }}"
+
+        - name: Add DNS configuration to Netplan
+          ansible.builtin.set_fact:
+            netplan_iface: >-
+              {{
+                netplan_iface
+                | combine({
+                    'nameservers': {
+                      'addresses': dns_servers
+                    }
+                  })
+              }}
+          when: dns_servers | length > 0
+
+        - name: Build complete Netplan configuration
+          ansible.builtin.set_fact:
+            netplan_config:
+              network:
+                version: 2
+                renderer: networkd
+                ethernets: "{{ dict([(target_iface, netplan_iface)]) }}"
+
+        - name: Write static Netplan configuration
+          ansible.builtin.copy:
+            dest: /etc/netplan/50-cloud-init.yaml
+            owner: root
+            group: root
+            mode: "0600"
+            content: "{{ netplan_config | to_nice_yaml(indent=2) }}"
+
+        - name: Generate Netplan configuration
+          ansible.builtin.command: netplan generate
+          changed_when: false
+
+    - name: Enable Fastfetch on login
+      ansible.builtin.lineinfile:
+        path: /etc/profile
+        regexp: '^fastfetch$'
+        line: fastfetch
+        state: present
+        create: true
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Ensure SSH configuration directory exists
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure SSH
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/50-Debian.conf
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          PermitRootLogin yes
+          PasswordAuthentication yes
+      notify:
+        - Validate SSH configuration
+        - Reload SSH
+
+    - name: Check GRUB configuration
+      ansible.builtin.stat:
+        path: /etc/default/grub
+      register: grub_default
+
+    - name: Configure GRUB defaults
+      ansible.builtin.lineinfile:
+        path: /etc/default/grub
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - regexp: '^#*GRUB_TIMEOUT='
+          line: 'GRUB_TIMEOUT=0'
+
+        - regexp: '^#*GRUB_TIMEOUT_STYLE='
+          line: 'GRUB_TIMEOUT_STYLE=hidden'
+
+        - regexp: '^#*GRUB_DISABLE_OS_PROBER='
+          line: 'GRUB_DISABLE_OS_PROBER=false'
+      when: grub_default.stat.exists
+      notify: Regenerate GRUB configuration
+
+  handlers:
+    - name: Apply sysctl settings
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+    - name: Validate SSH configuration
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+
+    - name: Reload SSH
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: reloaded
+
+    - name: Regenerate GRUB configuration
+      ansible.builtin.shell: |
+        if command -v grub-mkconfig >/dev/null 2>&1; then
+            grub-mkconfig -o /boot/grub/grub.cfg
+        fi
+      args:
+        executable: /bin/sh
+      changed_when: true
